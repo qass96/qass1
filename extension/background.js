@@ -3,13 +3,12 @@ let isCapturing = false;
 const tabCaptures = new Map(); // tabId → { windowId, url, title, captures[] }
 let prevTabId = null;
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 // 서비스 워커 재시작 시 캡처 상태 복원
 chrome.storage.local.get('isCapturing').then(({ isCapturing: v }) => {
   isCapturing = !!v;
 });
-
-// ── 유틸 ──────────────────────────────────────────────────────────────────────
-const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ── 메시지 핸들러 ─────────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -54,7 +53,7 @@ async function setCapturing(value) {
   }
 }
 
-// ── 수동 스크롤 시 새 영역 추가 캡처 ─────────────────────────────────────────
+// ── 스크롤 감지 → 새 영역 캡처 ───────────────────────────────────────────────
 async function handleScrollCapture(tabId, windowId, msg) {
   if (!isCapturing) return;
   const state = tabCaptures.get(tabId);
@@ -62,7 +61,10 @@ async function handleScrollCapture(tabId, windowId, msg) {
 
   const { scrollY, scrollHeight, viewportH, viewportW, dpr } = msg;
   const last = state.captures[state.captures.length - 1];
-  if (last && scrollY + viewportH <= last.scrollY + last.viewportH + 50) return;
+
+  // 이전 캡처 하단보다 1px 이상 새 영역이 보이면 캡처
+  // (threshold를 0으로 낮춰 약간의 스크롤도 놓치지 않음)
+  if (last && scrollY + viewportH <= last.scrollY + last.viewportH) return;
 
   await doCapture(tabId, windowId || state.windowId, scrollY, scrollHeight, viewportH, viewportW, dpr);
 }
@@ -91,72 +93,7 @@ async function doCapture(tabId, windowId, scrollY, scrollHeight, viewportH, view
   }
 }
 
-// ── 자동 페이지 전체 스캔 ─────────────────────────────────────────────────────
-// 탭 진입 후 스크롤 없이도 페이지 하단까지 자동 캡처
-async function autoScanPage(tabId, windowId) {
-  const state = tabCaptures.get(tabId);
-  if (!state) return;
-
-  const info = await getScrollInfo(tabId);
-  const { scrollHeight, viewportH, viewportW, dpr } = info;
-
-  // 페이지가 뷰포트보다 크지 않으면 스캔 불필요
-  if (scrollHeight <= viewportH + 10) return;
-
-  const OVERLAP = 60; // 조각 간 겹치는 픽셀 (이음새 방지)
-  let scanY = viewportH - OVERLAP;
-
-  while (scanY < scrollHeight) {
-    // 탭이 여전히 활성 상태인지 확인
-    const [active] = await chrome.tabs.query({ active: true, windowId });
-    if (!active || active.id !== tabId) break;
-
-    // 이미 커버된 영역이면 건너뜀
-    const covered = state.captures.some(c =>
-      c.scrollY <= scanY && c.scrollY + c.viewportH >= scanY + viewportH - OVERLAP
-    );
-    if (!covered) {
-      // 해당 위치로 즉시 스크롤
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        func: y => window.scrollTo({ top: y, behavior: 'instant' }),
-        args: [scanY],
-      }).catch(() => {});
-
-      await sleep(180); // 렌더링 대기
-      const cur = await getScrollInfo(tabId);
-      await doCapture(tabId, windowId, scanY, cur.scrollHeight, cur.viewportH, cur.viewportW, cur.dpr);
-    }
-
-    scanY += viewportH - OVERLAP;
-  }
-
-  // 페이지 맨 아래가 확실히 포함되도록 마지막 캡처
-  const bottomY = Math.max(0, scrollHeight - viewportH);
-  const lastCap = state.captures[state.captures.length - 1];
-  if (!lastCap || lastCap.scrollY + lastCap.viewportH < scrollHeight - 10) {
-    const [active] = await chrome.tabs.query({ active: true, windowId });
-    if (active && active.id === tabId) {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        func: y => window.scrollTo({ top: y, behavior: 'instant' }),
-        args: [bottomY],
-      }).catch(() => {});
-      await sleep(180);
-      const cur = await getScrollInfo(tabId);
-      await doCapture(tabId, windowId, bottomY, cur.scrollHeight, cur.viewportH, cur.viewportW, cur.dpr);
-    }
-  }
-
-  // 스캔 완료 후 맨 위로 복원
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    func: () => window.scrollTo({ top: 0, behavior: 'instant' }),
-    args: [],
-  }).catch(() => {});
-}
-
-// ── 탭 완료 처리 ──────────────────────────────────────────────────────────────
+// ── 탭 완료 처리 (캡처 조각 → 합성 → 저장) ───────────────────────────────────
 async function finalizeTab(tabId) {
   const state = tabCaptures.get(tabId);
   tabCaptures.delete(tabId);
@@ -192,9 +129,7 @@ async function stitchCaptures(captures) {
   if (captures.length === 0) return null;
   if (captures.length === 1) return captures[0].dataUrl;
 
-  const { viewportW, viewportH, dpr } = captures[0];
-
-  // 전체 페이지 높이 = 캡처 중 가장 아래쪽 끝
+  const { viewportW, dpr } = captures[0];
   const totalCssH = captures.reduce((m, c) => Math.max(m, c.scrollY + c.viewportH), 0);
   const scale = Math.min(dpr || 1, 32000 / totalCssH);
 
@@ -204,7 +139,6 @@ async function stitchCaptures(captures) {
   const offscreen = new OffscreenCanvas(canvasW, canvasH);
   const ctx = offscreen.getContext('2d');
 
-  // scrollY 오름차순으로 정렬하여 순서대로 그리기
   const sorted = [...captures].sort((a, b) => a.scrollY - b.scrollY);
   for (const cap of sorted) {
     const resp = await fetch(cap.dataUrl);
@@ -233,7 +167,6 @@ function extractHostname(url) {
   try { return new URL(url).hostname; } catch { return url; }
 }
 
-// ── content script 스크롤 정보 요청 ──────────────────────────────────────────
 function getScrollInfo(tabId) {
   return new Promise(resolve => {
     const fallback = { scrollY: 0, scrollHeight: 0, viewportH: 900, viewportW: 1440, dpr: 1 };
@@ -257,17 +190,11 @@ chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
   await sleep(400);
   const info = await getScrollInfo(tabId);
   await doCapture(tabId, windowId, info.scrollY, info.scrollHeight, info.viewportH, info.viewportW, info.dpr);
-
-  // 초기 캡처 후 페이지 전체 자동 스캔
-  await autoScanPage(tabId, windowId);
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.status !== 'complete') return;
-
-  if (tabCaptures.has(tabId)) {
-    await finalizeTab(tabId);
-  }
+  if (tabCaptures.has(tabId)) await finalizeTab(tabId);
   if (!isCapturing) return;
 
   tabCaptures.set(tabId, { windowId: tab.windowId, url: tab.url, title: tab.title, captures: [] });
@@ -275,9 +202,6 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   await sleep(600);
   const info = await getScrollInfo(tabId);
   await doCapture(tabId, tab.windowId, info.scrollY, info.scrollHeight, info.viewportH, info.viewportW, info.dpr);
-
-  // 페이지 로드 후 전체 자동 스캔
-  await autoScanPage(tabId, tab.windowId);
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
