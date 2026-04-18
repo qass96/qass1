@@ -2,7 +2,7 @@
 
 body {
   font-family: 'Segoe UI', sans-serif;
-  width: 420px;
+  width: 600px;
   min-height: 200px;
   background: #f8fafc;
   color: #1e293b;
@@ -97,12 +97,12 @@ body {
 
 /* LIST */
 .list {
-  max-height: 520px;
+  max-height: 700px;
   overflow-y: auto;
   padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 16px;
 }
 
 .empty-msg {
@@ -184,9 +184,7 @@ body {
   width: 100%;
   display: block;
   cursor: pointer;
-  max-height: 180px;
-  object-fit: cover;
-  object-position: top;
+  height: auto;
 }
 
-.item-thumb:hover { opacity: 0.9; }
+.item-thumb:hover { opacity: 0.85; }
