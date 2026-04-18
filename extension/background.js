@@ -16,7 +16,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const windowId = sender.tab?.windowId;
 
   if (msg.type === 'SCROLL_CHANGED' && tabId) {
-    handleScrollCapture(tabId, windowId, msg);
+    // SW 재시작 후 메모리 isCapturing이 false일 수 있으므로 storage에서 직접 확인
+    chrome.storage.local.get('isCapturing').then(({ isCapturing: v }) => {
+      if (v) handleScrollCapture(tabId, windowId, msg);
+    });
     return;
   }
   if (msg.type === 'GET_STATUS') {
@@ -55,15 +58,16 @@ async function setCapturing(value) {
 
 // ── 스크롤 감지 → 새 영역 캡처 ───────────────────────────────────────────────
 async function handleScrollCapture(tabId, windowId, msg) {
-  if (!isCapturing) return;
-  const state = tabCaptures.get(tabId);
-  if (!state) return;
+  // SW 재시작으로 tabCaptures가 비어있으면 새로 초기화해서 캡처 이어감
+  if (!tabCaptures.has(tabId)) {
+    tabCaptures.set(tabId, { windowId, url: '', title: '', captures: [] });
+  }
 
+  const state = tabCaptures.get(tabId);
   const { scrollY, scrollHeight, viewportH, viewportW, dpr } = msg;
   const last = state.captures[state.captures.length - 1];
 
   // 이전 캡처 하단보다 1px 이상 새 영역이 보이면 캡처
-  // (threshold를 0으로 낮춰 약간의 스크롤도 놓치지 않음)
   if (last && scrollY + viewportH <= last.scrollY + last.viewportH) return;
 
   await doCapture(tabId, windowId || state.windowId, scrollY, scrollHeight, viewportH, viewportW, dpr);

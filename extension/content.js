@@ -13,7 +13,7 @@ function getScrollInfo() {
   };
 }
 
-// 스크롤 멈춘 후 400ms 뒤 background에 보고
+// 스크롤 멈춘 후 200ms 뒤 background에 보고
 window.addEventListener('scroll', () => {
   clearTimeout(scrollDebounceTimer);
   scrollDebounceTimer = setTimeout(() => {
@@ -22,7 +22,7 @@ window.addEventListener('scroll', () => {
       lastReportedScrollY = info.scrollY;
       chrome.runtime.sendMessage({ type: 'SCROLL_CHANGED', ...info }).catch(() => {});
     }
-  }, 400);
+  }, 200);
 }, { passive: true });
 
 // background의 요청에 응답
