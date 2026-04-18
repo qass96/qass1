@@ -8,6 +8,9 @@ chrome.storage.local.get('isCapturing').then(({ isCapturing: v }) => {
   isCapturing = !!v;
 });
 
+// ── 유틸 ──────────────────────────────────────────────────────────────────────
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 // ── 메시지 핸들러 ─────────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const tabId = sender.tab?.id;
@@ -17,22 +20,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     handleScrollCapture(tabId, windowId, msg);
     return;
   }
-
   if (msg.type === 'GET_STATUS') {
     sendResponse({ isCapturing });
     return true;
   }
-
   if (msg.type === 'SET_CAPTURING') {
     setCapturing(msg.value).then(() => sendResponse({ ok: true }));
     return true;
   }
-
   if (msg.type === 'GET_HISTORY') {
     chrome.storage.local.get('history').then(({ history = [] }) => sendResponse(history));
     return true;
   }
-
   if (msg.type === 'CLEAR_HISTORY') {
     chrome.storage.local.set({ history: [] }).then(() => sendResponse({ ok: true }));
     return true;
@@ -45,7 +44,6 @@ async function setCapturing(value) {
   await chrome.storage.local.set({ isCapturing: value });
 
   if (value) {
-    // 이미 열린 탭에 content script 재주입
     const tabs = await chrome.tabs.query({});
     for (const tab of tabs) {
       if (!tab.url || tab.url.startsWith('chrome') || tab.url.startsWith('about')) continue;
@@ -56,17 +54,14 @@ async function setCapturing(value) {
   }
 }
 
-// ── 스크롤 시 새 영역 캡처 ────────────────────────────────────────────────────
+// ── 수동 스크롤 시 새 영역 추가 캡처 ─────────────────────────────────────────
 async function handleScrollCapture(tabId, windowId, msg) {
   if (!isCapturing) return;
-
   const state = tabCaptures.get(tabId);
   if (!state) return;
 
   const { scrollY, scrollHeight, viewportH, viewportW, dpr } = msg;
   const last = state.captures[state.captures.length - 1];
-
-  // 이전 캡처 하단에서 50px 이상 새 영역이 보일 때만 캡처
   if (last && scrollY + viewportH <= last.scrollY + last.viewportH + 50) return;
 
   await doCapture(tabId, windowId || state.windowId, scrollY, scrollHeight, viewportH, viewportW, dpr);
@@ -76,20 +71,14 @@ async function handleScrollCapture(tabId, windowId, msg) {
 async function doCapture(tabId, windowId, scrollY, scrollHeight, viewportH, viewportW, dpr) {
   try {
     const tab = await chrome.tabs.get(tabId);
-
-    // 해당 탭이 현재 활성 탭인지 확인 (다른 탭으로 이미 이동했으면 캡처 불가)
     const [activeTab] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
-    if (!activeTab || activeTab.id !== tabId) {
-      console.log(`[QA] skip: tab ${tabId} is no longer active`);
-      return;
-    }
+    if (!activeTab || activeTab.id !== tabId) return;
 
     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
 
     if (!tabCaptures.has(tabId)) {
       tabCaptures.set(tabId, { windowId: tab.windowId, url: tab.url, title: tab.title, captures: [] });
     }
-
     const state = tabCaptures.get(tabId);
     state.url = tab.url;
     state.title = tab.title;
@@ -102,14 +91,76 @@ async function doCapture(tabId, windowId, scrollY, scrollHeight, viewportH, view
   }
 }
 
-// ── 탭 완료 처리 (캡처 조각 → 합성 → 저장) ───────────────────────────────────
+// ── 자동 페이지 전체 스캔 ─────────────────────────────────────────────────────
+// 탭 진입 후 스크롤 없이도 페이지 하단까지 자동 캡처
+async function autoScanPage(tabId, windowId) {
+  const state = tabCaptures.get(tabId);
+  if (!state) return;
+
+  const info = await getScrollInfo(tabId);
+  const { scrollHeight, viewportH, viewportW, dpr } = info;
+
+  // 페이지가 뷰포트보다 크지 않으면 스캔 불필요
+  if (scrollHeight <= viewportH + 10) return;
+
+  const OVERLAP = 60; // 조각 간 겹치는 픽셀 (이음새 방지)
+  let scanY = viewportH - OVERLAP;
+
+  while (scanY < scrollHeight) {
+    // 탭이 여전히 활성 상태인지 확인
+    const [active] = await chrome.tabs.query({ active: true, windowId });
+    if (!active || active.id !== tabId) break;
+
+    // 이미 커버된 영역이면 건너뜀
+    const covered = state.captures.some(c =>
+      c.scrollY <= scanY && c.scrollY + c.viewportH >= scanY + viewportH - OVERLAP
+    );
+    if (!covered) {
+      // 해당 위치로 즉시 스크롤
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: y => window.scrollTo({ top: y, behavior: 'instant' }),
+        args: [scanY],
+      }).catch(() => {});
+
+      await sleep(180); // 렌더링 대기
+      const cur = await getScrollInfo(tabId);
+      await doCapture(tabId, windowId, scanY, cur.scrollHeight, cur.viewportH, cur.viewportW, cur.dpr);
+    }
+
+    scanY += viewportH - OVERLAP;
+  }
+
+  // 페이지 맨 아래가 확실히 포함되도록 마지막 캡처
+  const bottomY = Math.max(0, scrollHeight - viewportH);
+  const lastCap = state.captures[state.captures.length - 1];
+  if (!lastCap || lastCap.scrollY + lastCap.viewportH < scrollHeight - 10) {
+    const [active] = await chrome.tabs.query({ active: true, windowId });
+    if (active && active.id === tabId) {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: y => window.scrollTo({ top: y, behavior: 'instant' }),
+        args: [bottomY],
+      }).catch(() => {});
+      await sleep(180);
+      const cur = await getScrollInfo(tabId);
+      await doCapture(tabId, windowId, bottomY, cur.scrollHeight, cur.viewportH, cur.viewportW, cur.dpr);
+    }
+  }
+
+  // 스캔 완료 후 맨 위로 복원
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => window.scrollTo({ top: 0, behavior: 'instant' }),
+    args: [],
+  }).catch(() => {});
+}
+
+// ── 탭 완료 처리 ──────────────────────────────────────────────────────────────
 async function finalizeTab(tabId) {
   const state = tabCaptures.get(tabId);
   tabCaptures.delete(tabId);
-
   if (!state || state.captures.length === 0) return;
-
-  console.log(`[QA] finalizing tab=${tabId} pieces=${state.captures.length}`);
 
   const stitchedDataUrl = await stitchCaptures(state.captures);
   if (!stitchedDataUrl) return;
@@ -127,7 +178,7 @@ async function finalizeTab(tabId) {
   history.unshift(record);
   if (history.length > 30) history.splice(30);
   await chrome.storage.local.set({ history });
-  console.log(`[QA] saved record for "${record.title}"`);
+  console.log(`[QA] saved "${record.title}" (${record.captureCount} pieces)`);
 }
 
 async function finalizeAll() {
@@ -141,19 +192,21 @@ async function stitchCaptures(captures) {
   if (captures.length === 0) return null;
   if (captures.length === 1) return captures[0].dataUrl;
 
-  const first = captures[0];
-  const dpr = first.dpr || 1;
+  const { viewportW, viewportH, dpr } = captures[0];
 
+  // 전체 페이지 높이 = 캡처 중 가장 아래쪽 끝
   const totalCssH = captures.reduce((m, c) => Math.max(m, c.scrollY + c.viewportH), 0);
-  const scale = Math.min(dpr, 32000 / totalCssH);
+  const scale = Math.min(dpr || 1, 32000 / totalCssH);
 
-  const canvasW = Math.round(first.viewportW * scale);
+  const canvasW = Math.round(viewportW * scale);
   const canvasH = Math.round(totalCssH * scale);
 
   const offscreen = new OffscreenCanvas(canvasW, canvasH);
   const ctx = offscreen.getContext('2d');
 
-  for (const cap of captures) {
+  // scrollY 오름차순으로 정렬하여 순서대로 그리기
+  const sorted = [...captures].sort((a, b) => a.scrollY - b.scrollY);
+  for (const cap of sorted) {
     const resp = await fetch(cap.dataUrl);
     const blob = await resp.blob();
     const bitmap = await createImageBitmap(blob);
@@ -180,63 +233,53 @@ function extractHostname(url) {
   try { return new URL(url).hostname; } catch { return url; }
 }
 
+// ── content script 스크롤 정보 요청 ──────────────────────────────────────────
+function getScrollInfo(tabId) {
+  return new Promise(resolve => {
+    const fallback = { scrollY: 0, scrollHeight: 0, viewportH: 900, viewportW: 1440, dpr: 1 };
+    chrome.tabs.sendMessage(tabId, { type: 'GET_SCROLL_INFO' }, resp => {
+      resolve(chrome.runtime.lastError || !resp ? fallback : resp);
+    });
+  });
+}
+
 // ── 탭 이벤트 ─────────────────────────────────────────────────────────────────
 
-// 탭 전환: 이전 탭 완료, 새 탭 캡처 시작
 chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
-  // 이전 탭 finalize
   if (prevTabId && prevTabId !== tabId && tabCaptures.has(prevTabId)) {
     await finalizeTab(prevTabId);
   }
   prevTabId = tabId;
-
   if (!isCapturing) return;
 
-  // 새 탭 상태 초기화
   tabCaptures.set(tabId, { windowId, url: '', title: '', captures: [] });
 
-  // 탭 렌더링 대기 후 캡처
-  setTimeout(async () => {
-    const scrollInfo = await getScrollInfo(tabId);
-    await doCapture(tabId, windowId, scrollInfo.scrollY, scrollInfo.scrollHeight, scrollInfo.viewportH, scrollInfo.viewportW, scrollInfo.dpr);
-  }, 400);
+  await sleep(400);
+  const info = await getScrollInfo(tabId);
+  await doCapture(tabId, windowId, info.scrollY, info.scrollHeight, info.viewportH, info.viewportW, info.dpr);
+
+  // 초기 캡처 후 페이지 전체 자동 스캔
+  await autoScanPage(tabId, windowId);
 });
 
-// 페이지 이동(URL 변경): 기존 캡처 완료 후 새로 시작
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.status !== 'complete') return;
 
   if (tabCaptures.has(tabId)) {
     await finalizeTab(tabId);
   }
-
   if (!isCapturing) return;
 
   tabCaptures.set(tabId, { windowId: tab.windowId, url: tab.url, title: tab.title, captures: [] });
 
-  setTimeout(async () => {
-    const scrollInfo = await getScrollInfo(tabId);
-    await doCapture(tabId, tab.windowId, scrollInfo.scrollY, scrollInfo.scrollHeight, scrollInfo.viewportH, scrollInfo.viewportW, scrollInfo.dpr);
-  }, 600);
+  await sleep(600);
+  const info = await getScrollInfo(tabId);
+  await doCapture(tabId, tab.windowId, info.scrollY, info.scrollHeight, info.viewportH, info.viewportW, info.dpr);
+
+  // 페이지 로드 후 전체 자동 스캔
+  await autoScanPage(tabId, tab.windowId);
 });
 
-// 탭 닫힘
 chrome.tabs.onRemoved.addListener(async (tabId) => {
-  if (tabCaptures.has(tabId)) {
-    await finalizeTab(tabId);
-  }
+  if (tabCaptures.has(tabId)) await finalizeTab(tabId);
 });
-
-// ── content script에서 스크롤 정보 가져오기 ──────────────────────────────────
-function getScrollInfo(tabId) {
-  return new Promise(resolve => {
-    const fallback = { scrollY: 0, scrollHeight: 0, viewportH: 900, viewportW: 1440, dpr: 1 };
-    chrome.tabs.sendMessage(tabId, { type: 'GET_SCROLL_INFO' }, resp => {
-      if (chrome.runtime.lastError || !resp) {
-        resolve(fallback);
-      } else {
-        resolve(resp);
-      }
-    });
-  });
-}
