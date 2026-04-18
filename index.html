@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>QA 증적 캡처 시스템</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <nav class="navbar">
+    <div class="nav-brand">QA Demo Site</div>
+    <ul class="nav-links">
+      <li><a href="#" onclick="navigate('home')">홈</a></li>
+      <li><a href="#" onclick="navigate('product')">제품 소개</a></li>
+      <li><a href="#" onclick="navigate('service')">서비스</a></li>
+      <li><a href="#" onclick="navigate('contact')">문의</a></li>
+    </ul>
+    <div class="nav-controls">
+      <button id="btn-start" class="btn-start" onclick="startCapture()">▶ 시작</button>
+      <button id="btn-stop" class="btn-stop" onclick="stopCapture()" disabled>■ 종료</button>
+      <span id="capture-status" class="capture-status stopped">대기 중</span>
+    </div>
+    <button class="btn-capture-log" onclick="toggleLog()">증적 보기 (<span id="capture-count">0</span>)</button>
+  </nav>
+
+  <main id="main-content">
+
+    <section id="page-home" class="page active">
+      <div class="page-inner">
+        <h1>환영합니다</h1>
+        <p>이 사이트는 QA 증적 자동 캡처 데모입니다.<br>페이지를 이동할 때마다 스크린샷이 자동으로 저장됩니다.</p>
+        <div class="card-grid">
+          <div class="card">빠른 캡처</div>
+          <div class="card">자동 저장</div>
+          <div class="card">증적 관리</div>
+        </div>
+        <button class="btn-primary" onclick="navigate('product')">제품 소개 보기 →</button>
+      </div>
+    </section>
+
+    <section id="page-product" class="page">
+      <div class="page-inner">
+        <h1>제품 소개</h1>
+        <p>주요 기능과 제품 라인업을 소개합니다.</p>
+        <div class="card-grid">
+          <div class="card product-card">
+            <h3>플랜 A</h3>
+            <p>기본 기능 제공</p>
+            <span class="price">&#8361;9,900/월</span>
+          </div>
+          <div class="card product-card">
+            <h3>플랜 B</h3>
+            <p>고급 기능 포함</p>
+            <span class="price">&#8361;29,900/월</span>
+          </div>
+          <div class="card product-card">
+            <h3>플랜 C</h3>
+            <p>엔터프라이즈 전용</p>
+            <span class="price">문의</span>
+          </div>
+        </div>
+        <button class="btn-primary" onclick="navigate('service')">서비스 보기 →</button>
+      </div>
+    </section>
+
+    <section id="page-service" class="page">
+      <div class="page-inner">
+        <h1>서비스</h1>
+        <p>고객을 위한 다양한 서비스를 제공합니다.</p>
+        <ul class="service-list">
+          <li>✅ 24시간 고객 지원</li>
+          <li>✅ 클라우드 자동 백업</li>
+          <li>✅ 실시간 모니터링</li>
+          <li>✅ API 연동 지원</li>
+          <li>✅ 전담 매니저 배정</li>
+        </ul>
+        <button class="btn-primary" onclick="navigate('contact')">문의하기 →</button>
+      </div>
+    </section>
+
+    <section id="page-contact" class="page">
+      <div class="page-inner">
+        <h1>문의</h1>
+        <p>궁금한 점이 있으시면 아래 양식을 작성해주세요.</p>
+        <form class="contact-form" onsubmit="return false;">
+          <input type="text" placeholder="이름" />
+          <input type="email" placeholder="이메일" />
+          <textarea placeholder="문의 내용을 입력하세요"></textarea>
+          <button type="submit" class="btn-primary">전송하기</button>
+        </form>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- 캡처 로그 패널 -->
+  <div id="capture-log" class="capture-log hidden">
+    <div class="log-header">
+      <h2>QA 증적 캡처 로그</h2>
+      <div class="log-actions">
+        <button class="btn-download-all" onclick="downloadAll()">전체 다운로드</button>
+        <button class="btn-clear" onclick="clearLog()">초기화</button>
+        <button class="btn-close" onclick="toggleLog()">✕</button>
+      </div>
+    </div>
+    <div id="log-list" class="log-list">
+      <p class="empty-msg">아직 캡처된 페이지가 없습니다.</p>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="main.js"></script>
+</body>
+</html>
