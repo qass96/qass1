@@ -101,6 +101,28 @@ body {
   opacity: 0.6;
 }
 
+.btn-snap {
+  background: #f59e0b;
+  color: #fff;
+  border: none;
+  padding: 7px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  transition: background 0.2s;
+}
+
+.btn-snap:hover:not(:disabled) {
+  background: #d97706;
+}
+
+.btn-snap:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+
 .capture-status {
   font-size: 12px;
   font-weight: 600;
@@ -406,6 +428,20 @@ body {
 
 .btn-dl:hover {
   background: #2563eb;
+}
+
+/* GUIDE BANNER */
+.guide-banner {
+  background: #fef9c3;
+  color: #854d0e;
+  text-align: center;
+  padding: 10px 20px;
+  font-size: 14px;
+  border-bottom: 1px solid #fde68a;
+}
+
+.guide-banner.hidden {
+  display: none;
 }
 
 /* TOAST */
