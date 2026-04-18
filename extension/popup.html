@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>QA 증적 캡처</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="header">
+    <div class="header-title">QA 증적 캡처</div>
+    <div class="header-controls">
+      <button id="btn-toggle" class="btn-start" onclick="toggleCapture()">▶ 시작</button>
+      <button id="btn-clear" class="btn-clear" onclick="clearAll()">초기화</button>
+      <button id="btn-dl-all" class="btn-dlall" onclick="downloadAll()">전체 저장</button>
+    </div>
+  </div>
+
+  <div id="status-bar" class="status-bar stopped">
+    <span id="status-text">대기 중 — 시작 버튼을 누르면 탭 이동 시 자동 캡처됩니다</span>
+  </div>
+
+  <div id="list" class="list">
+    <div class="empty-msg">캡처된 페이지가 없습니다.</div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
