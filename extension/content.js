@@ -20,7 +20,9 @@ window.addEventListener('scroll', () => {
     const info = getScrollInfo();
     if (info.scrollY !== lastReportedScrollY) {
       lastReportedScrollY = info.scrollY;
-      chrome.runtime.sendMessage({ type: 'SCROLL_CHANGED', ...info }).catch(() => {});
+      try {
+        chrome.runtime.sendMessage({ type: 'SCROLL_CHANGED', ...info }).catch(() => {});
+      } catch (_) {}
     }
   }, 200);
 }, { passive: true });
