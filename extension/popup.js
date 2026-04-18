@@ -1,20 +1,23 @@
 let isCapturing = false;
+let cachedHistory = [];
 
-// 팝업 열릴 때 초기화
 document.addEventListener('DOMContentLoaded', async () => {
+  // 버튼 이벤트 (onclick 속성 대신 addEventListener 사용 — MV3 CSP 정책)
+  document.getElementById('btn-toggle').addEventListener('click', toggleCapture);
+  document.getElementById('btn-clear').addEventListener('click', clearAll);
+  document.getElementById('btn-dl-all').addEventListener('click', downloadAll);
+
   const resp = await chrome.runtime.sendMessage({ type: 'GET_STATUS' });
   isCapturing = resp.isCapturing;
   updateToggleBtn();
   await loadHistory();
 });
 
-// 시작 / 종료 토글
 async function toggleCapture() {
   isCapturing = !isCapturing;
   await chrome.runtime.sendMessage({ type: 'SET_CAPTURING', value: isCapturing });
   updateToggleBtn();
   if (!isCapturing) {
-    // 종료 시 잠시 후 새로 저장된 항목 반영
     setTimeout(loadHistory, 1200);
   }
 }
@@ -37,69 +40,84 @@ function updateToggleBtn() {
   }
 }
 
-// 저장된 캡처 목록 로드
 async function loadHistory() {
-  const history = await chrome.runtime.sendMessage({ type: 'GET_HISTORY' });
-  renderList(history);
+  cachedHistory = await chrome.runtime.sendMessage({ type: 'GET_HISTORY' });
+  renderList(cachedHistory);
 }
 
 function renderList(history) {
   const list = document.getElementById('list');
+  list.innerHTML = '';
 
   if (!history || history.length === 0) {
     list.innerHTML = '<div class="empty-msg">캡처된 페이지가 없습니다.</div>';
     return;
   }
 
-  list.innerHTML = '';
   history.forEach(rec => {
     const item = document.createElement('div');
     item.className = 'capture-item';
-    item.innerHTML = `
-      <div class="item-header">
-        <div class="item-meta">
-          <div class="item-title" title="${esc(rec.title)}">${esc(rec.title)}</div>
-          <div class="item-url" title="${esc(rec.url)}">${esc(rec.url)}</div>
-          <div class="item-info">${esc(rec.timestamp)} · ${rec.captureCount}개 조각 합성</div>
-        </div>
-        <div class="item-actions">
-          <button onclick="viewFull('${rec.id}')">전체 보기</button>
-          <button onclick="download('${rec.id}')">저장</button>
-        </div>
-      </div>
-      <img src="${rec.dataUrl}" class="item-thumb" onclick="viewFull('${rec.id}')" title="클릭하면 전체 이미지를 새 탭에서 봅니다" />
+
+    const header = document.createElement('div');
+    header.className = 'item-header';
+
+    const meta = document.createElement('div');
+    meta.className = 'item-meta';
+    meta.innerHTML = `
+      <div class="item-title" title="${esc(rec.title)}">${esc(rec.title)}</div>
+      <div class="item-url" title="${esc(rec.url)}">${esc(rec.url)}</div>
+      <div class="item-info">${esc(rec.timestamp)} · ${rec.captureCount}개 조각 합성</div>
     `;
-    item.dataset.id = rec.id;
-    item.dataset.dataUrl = rec.dataUrl;
-    item.dataset.title = rec.title;
+
+    const actions = document.createElement('div');
+    actions.className = 'item-actions';
+
+    const btnView = document.createElement('button');
+    btnView.textContent = '전체 보기';
+    btnView.addEventListener('click', () => viewFull(rec.id));
+
+    const btnDl = document.createElement('button');
+    btnDl.textContent = '저장';
+    btnDl.addEventListener('click', () => downloadOne(rec.id));
+
+    actions.appendChild(btnView);
+    actions.appendChild(btnDl);
+    header.appendChild(meta);
+    header.appendChild(actions);
+
+    const img = document.createElement('img');
+    img.src = rec.dataUrl;
+    img.className = 'item-thumb';
+    img.title = '클릭하면 전체 이미지를 새 탭에서 봅니다';
+    img.addEventListener('click', () => viewFull(rec.id));
+
+    item.appendChild(header);
+    item.appendChild(img);
     list.appendChild(item);
   });
 }
 
-async function viewFull(id) {
-  const history = await chrome.runtime.sendMessage({ type: 'GET_HISTORY' });
-  const rec = history.find(r => String(r.id) === String(id));
+function viewFull(id) {
+  const rec = cachedHistory.find(r => String(r.id) === String(id));
   if (!rec) return;
-  const w = window.open();
-  w.document.write(`
-    <html><head><title>${esc(rec.title)}</title></head>
-    <body style="margin:0;background:#111;">
-      <img src="${rec.dataUrl}" style="display:block;max-width:100%;height:auto;" />
-    </body></html>
-  `);
+  const w = window.open('', '_blank');
+  w.document.write(
+    `<html><head><title>${esc(rec.title)}</title></head>` +
+    `<body style="margin:0;background:#111;">` +
+    `<img src="${rec.dataUrl}" style="display:block;max-width:100%;height:auto;" />` +
+    `</body></html>`
+  );
 }
 
-async function download(id) {
-  const history = await chrome.runtime.sendMessage({ type: 'GET_HISTORY' });
-  const rec = history.find(r => String(r.id) === String(id));
+function downloadOne(id) {
+  const rec = cachedHistory.find(r => String(r.id) === String(id));
   if (!rec) return;
   triggerDownload(rec.dataUrl, makeFileName(rec.title, rec.timestamp));
 }
 
 async function downloadAll() {
-  const history = await chrome.runtime.sendMessage({ type: 'GET_HISTORY' });
-  if (!history || history.length === 0) return;
-  history.forEach((rec, i) => {
+  if (!cachedHistory || cachedHistory.length === 0) return;
+  cachedHistory.forEach((rec, i) => {
     setTimeout(() => triggerDownload(rec.dataUrl, makeFileName(rec.title, rec.timestamp)), i * 400);
   });
 }
@@ -107,7 +125,8 @@ async function downloadAll() {
 async function clearAll() {
   if (!confirm('캡처 기록을 모두 삭제할까요?')) return;
   await chrome.runtime.sendMessage({ type: 'CLEAR_HISTORY' });
-  await loadHistory();
+  cachedHistory = [];
+  renderList([]);
 }
 
 function triggerDownload(dataUrl, fileName) {
@@ -119,7 +138,7 @@ function triggerDownload(dataUrl, fileName) {
 
 function makeFileName(title, timestamp) {
   const safe = (title || 'capture').replace(/[\\/:*?"<>|]/g, '_').slice(0, 40);
-  const ts = timestamp.replace(/[. :]/g, '').slice(0, 14);
+  const ts = (timestamp || '').replace(/[. :]/g, '').slice(0, 14);
   return `QA_${safe}_${ts}.png`;
 }
 
