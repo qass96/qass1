@@ -67,11 +67,7 @@ async function handleScrollCapture(tabId, windowId, msg) {
   if (state.scanning) return; // 자동 스캔 중에는 수동 스크롤 무시
 
   const { scrollY, scrollHeight, viewportH, viewportW, dpr } = msg;
-  const last = state.captures[state.captures.length - 1];
-
-  // 이전 캡처 하단보다 1px 이상 새 영역이 보이면 캡처
-  if (last && scrollY + viewportH <= last.scrollY + last.viewportH) return;
-
+  // QA 증적: 스크롤 위치가 조금이라도 바뀌면 무조건 캡처
   await doCapture(tabId, windowId || state.windowId, scrollY, scrollHeight, viewportH, viewportW, dpr);
 }
 
@@ -134,9 +130,8 @@ async function doCapture(tabId, windowId, scrollY, scrollHeight, viewportH, view
       tabCaptures.set(tabId, { windowId: tab.windowId, url: tab.url, title: tab.title, captures: [] });
     }
     const state = tabCaptures.get(tabId);
-    // 이미 캡처된 영역이면 중복 추가 방지
-    const last = state.captures[state.captures.length - 1];
-    if (last && scrollY + viewportH <= last.scrollY + last.viewportH) return;
+    // 완전히 동일한 scrollY만 중복 방지
+    if (state.captures.some(c => c.scrollY === scrollY)) return;
     state.url = tab.url;
     state.title = tab.title;
     state.windowId = tab.windowId;
