@@ -162,6 +162,11 @@ async function finalizeTab(tabId) {
   };
 
   const { history = [] } = await chrome.storage.local.get('history');
+  // 동일 URL이 이미 있으면 최신 캡처로 교체, 없으면 앞에 추가
+  const existingIdx = history.findIndex(h => h.url === record.url);
+  if (existingIdx !== -1) {
+    history.splice(existingIdx, 1);
+  }
   history.unshift(record);
   if (history.length > 30) history.splice(30);
   await chrome.storage.local.set({ history });
