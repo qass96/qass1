@@ -1,7 +1,6 @@
 // 페이지 정보 반환 및 스크롤 감지
 
 let scrollDebounceTimer = null;
-let lastReportedScrollY = -1;
 
 function getScrollInfo() {
   return {
@@ -14,18 +13,16 @@ function getScrollInfo() {
 }
 
 // 스크롤 멈춘 후 200ms 뒤 background에 보고
-window.addEventListener('scroll', () => {
+// capture: true → window 스크롤뿐 아니라 페이지 내 모든 스크롤 영역(div 등)도 감지
+document.addEventListener('scroll', () => {
   clearTimeout(scrollDebounceTimer);
   scrollDebounceTimer = setTimeout(() => {
     const info = getScrollInfo();
-    if (info.scrollY !== lastReportedScrollY) {
-      lastReportedScrollY = info.scrollY;
-      try {
-        chrome.runtime.sendMessage({ type: 'SCROLL_CHANGED', ...info }).catch(() => {});
-      } catch (_) {}
-    }
+    try {
+      chrome.runtime.sendMessage({ type: 'SCROLL_CHANGED', ...info }).catch(() => {});
+    } catch (_) {}
   }, 200);
-}, { passive: true });
+}, { passive: true, capture: true });
 
 // background의 요청에 응답
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
