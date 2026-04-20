@@ -1,6 +1,6 @@
 // ── 상태 ──────────────────────────────────────────────────────────────────────
 let isCapturing = false;
-const tabCaptures = new Map(); // tabId → { windowId, url, title, captures[] }
+const tabCaptures = new Map(); // tabId → { windowId, url, title, captures[], scanning }
 let prevTabId = null;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -16,7 +16,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const windowId = sender.tab?.windowId;
 
   if (msg.type === 'SCROLL_CHANGED' && tabId) {
-    // SW 재시작 후 메모리 isCapturing이 false일 수 있으므로 storage에서 직접 확인
     chrome.storage.local.get('isCapturing').then(({ isCapturing: v }) => {
       if (v) handleScrollCapture(tabId, windowId, msg);
     });
@@ -56,18 +55,139 @@ async function setCapturing(value) {
   }
 }
 
-// ── 스크롤 감지 → 새 영역 캡처 ───────────────────────────────────────────────
+// ── 수동 스크롤 감지 → 캡처 ───────────────────────────────────────────────────
 async function handleScrollCapture(tabId, windowId, msg) {
-  // SW 재시작으로 tabCaptures가 비어있으면 새로 초기화해서 캡처 이어감
   if (!tabCaptures.has(tabId)) {
     tabCaptures.set(tabId, { windowId, url: '', title: '', captures: [] });
   }
-
   const state = tabCaptures.get(tabId);
+  if (state.scanning) return; // 자동 스캔 중에는 수동 스크롤 무시
+
   const { scrollY, scrollHeight, viewportH, viewportW, dpr } = msg;
   await doCapture(tabId, windowId || state.windowId, scrollY, scrollHeight, viewportH, viewportW, dpr);
 }
 
+// ── 페이지 전체 자동 스캔 (윈도우 + 내부 스크롤) ──────────────────────────────
+async function fullPageScan(tabId, windowId) {
+  if (!tabCaptures.has(tabId)) {
+    tabCaptures.set(tabId, { windowId, url: '', title: '', captures: [] });
+  }
+  const state = tabCaptures.get(tabId);
+  state.scanning = true;
+
+  try {
+    // 1. 윈도우 스크롤 전체 스캔
+    await windowScan(tabId, windowId);
+
+    // 2. 내부 스크롤 요소 스캔
+    await innerScan(tabId, windowId);
+
+    // 3. 맨 위로 복귀
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => window.scrollTo(0, 0),
+      args: [],
+    }).catch(() => {});
+  } finally {
+    state.scanning = false;
+  }
+}
+
+// 윈도우 스크롤 전체 스캔
+async function windowScan(tabId, windowId) {
+  const info = await getScrollInfo(tabId);
+  const { scrollHeight, viewportH, viewportW, dpr } = info;
+
+  const positions = [];
+  for (let y = 0; y + viewportH <= scrollHeight; y += viewportH) {
+    positions.push(y);
+  }
+  const bottom = Math.max(0, scrollHeight - viewportH);
+  if (positions.length === 0 || positions[positions.length - 1] < bottom) {
+    positions.push(bottom);
+  }
+
+  for (const y of positions) {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (sy) => window.scrollTo(0, sy),
+      args: [y],
+    }).catch(() => {});
+    await sleep(200);
+    const actual = await getScrollInfo(tabId);
+    await doCapture(tabId, windowId, actual.scrollY, actual.scrollHeight, viewportH, viewportW, dpr);
+  }
+}
+
+// 내부 스크롤 요소 스캔
+async function innerScan(tabId, windowId) {
+  // 스크롤 가능한 내부 요소 탐색 및 임시 인덱스 부여
+  let elements = [];
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        let i = 0;
+        const list = [];
+        for (const el of document.querySelectorAll('*')) {
+          if (el === document.body || el === document.documentElement) continue;
+          const s = getComputedStyle(el);
+          const canScroll = (s.overflowY === 'scroll' || s.overflowY === 'auto')
+            && el.scrollHeight > el.clientHeight + 5
+            && el.clientHeight > 50;
+          if (canScroll) {
+            el.setAttribute('data-qa-scan', i);
+            list.push({ idx: i++, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight });
+          }
+        }
+        return list;
+      },
+    });
+    elements = res?.result ?? [];
+  } catch (e) { return; }
+
+  if (elements.length === 0) return;
+
+  const { viewportH, viewportW, dpr, scrollHeight: pageScrollHeight } = await getScrollInfo(tabId);
+
+  for (const { idx, scrollHeight, clientHeight } of elements) {
+    const positions = [];
+    for (let y = 0; y + clientHeight <= scrollHeight; y += clientHeight) {
+      positions.push(y);
+    }
+    const bottom = Math.max(0, scrollHeight - clientHeight);
+    if (positions.length === 0 || positions[positions.length - 1] < bottom) {
+      positions.push(bottom);
+    }
+
+    for (const y of positions) {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (i, top) => {
+          const el = document.querySelector(`[data-qa-scan="${i}"]`);
+          if (el) el.scrollTop = top;
+        },
+        args: [idx, y],
+      }).catch(() => {});
+      await sleep(200);
+      const actual = await getScrollInfo(tabId);
+      await doCapture(tabId, windowId, actual.scrollY, pageScrollHeight, viewportH, viewportW, dpr);
+    }
+
+    // 요소 맨 위로 복귀
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (i) => { const el = document.querySelector(`[data-qa-scan="${i}"]`); if (el) el.scrollTop = 0; },
+      args: [idx],
+    }).catch(() => {});
+  }
+
+  // 임시 마킹 제거
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => document.querySelectorAll('[data-qa-scan]').forEach(el => el.removeAttribute('data-qa-scan')),
+  }).catch(() => {});
+}
 
 // ── 스크린샷 촬영 ─────────────────────────────────────────────────────────────
 async function doCapture(tabId, windowId, scrollY, scrollHeight, viewportH, viewportW, dpr) {
@@ -84,14 +204,12 @@ async function doCapture(tabId, windowId, scrollY, scrollHeight, viewportH, view
     const state = tabCaptures.get(tabId);
     const last = state.captures[state.captures.length - 1];
 
-    // stitchY: 합성 이미지에서의 Y 위치
-    // - scrollY가 바뀌었으면 scrollY 그대로 (윈도우 스크롤, 위치 기반 이어붙이기)
-    // - scrollY가 같으면 직전 캡처 아래에 추가 (내부 div 스크롤)
+    // scrollY가 같으면 내부 스크롤로 간주 → 직전 캡처 아래에 이어붙이기
     const stitchY = (last && scrollY === last.scrollY)
       ? last.stitchY + last.viewportH
       : scrollY;
 
-    // 직전과 완전히 동일한 위치(stitchY·scrollY 모두 같음)면 중복 스킵
+    // 직전과 완전히 동일한 위치면 중복 스킵
     if (last && last.scrollY === scrollY && last.stitchY === stitchY) return;
 
     state.url = tab.url;
@@ -124,11 +242,8 @@ async function finalizeTab(tabId) {
   };
 
   const { history = [] } = await chrome.storage.local.get('history');
-  // 동일 URL이 이미 있으면 최신 캡처로 교체, 없으면 앞에 추가
   const existingIdx = history.findIndex(h => h.url === record.url);
-  if (existingIdx !== -1) {
-    history.splice(existingIdx, 1);
-  }
+  if (existingIdx !== -1) history.splice(existingIdx, 1);
   history.unshift(record);
   if (history.length > 30) history.splice(30);
   await chrome.storage.local.set({ history });
@@ -147,7 +262,6 @@ async function stitchCaptures(captures) {
   if (captures.length === 1) return captures[0].dataUrl;
 
   const { viewportW, dpr } = captures[0];
-  // stitchY 기준으로 총 높이 계산 (내부 스크롤 포함)
   const totalCssH = captures.reduce((m, c) => Math.max(m, c.stitchY + c.viewportH), 0);
   const scale = Math.min(dpr || 1, 32000 / totalCssH);
 
@@ -206,8 +320,7 @@ chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
   tabCaptures.set(tabId, { windowId, url: '', title: '', captures: [] });
 
   await sleep(400);
-  const info = await getScrollInfo(tabId);
-  await doCapture(tabId, windowId, info.scrollY, info.scrollHeight, info.viewportH, info.viewportW, info.dpr);
+  await fullPageScan(tabId, windowId);
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
@@ -218,8 +331,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   tabCaptures.set(tabId, { windowId: tab.windowId, url: tab.url, title: tab.title, captures: [] });
 
   await sleep(600);
-  const info = await getScrollInfo(tabId);
-  await doCapture(tabId, tab.windowId, info.scrollY, info.scrollHeight, info.viewportH, info.viewportW, info.dpr);
+  await fullPageScan(tabId, tab.windowId);
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
