@@ -64,6 +64,8 @@ async function handleScrollCapture(tabId, windowId, msg) {
   }
 
   const state = tabCaptures.get(tabId);
+  if (state.scanning) return; // 자동 스캔 중에는 수동 스크롤 무시
+
   const { scrollY, scrollHeight, viewportH, viewportW, dpr } = msg;
   const last = state.captures[state.captures.length - 1];
 
@@ -71,6 +73,52 @@ async function handleScrollCapture(tabId, windowId, msg) {
   if (last && scrollY + viewportH <= last.scrollY + last.viewportH) return;
 
   await doCapture(tabId, windowId || state.windowId, scrollY, scrollHeight, viewportH, viewportW, dpr);
+}
+
+// ── 페이지 전체 자동 스캔 ─────────────────────────────────────────────────────
+async function fullPageScan(tabId, windowId) {
+  if (!tabCaptures.has(tabId)) {
+    tabCaptures.set(tabId, { windowId, url: '', title: '', captures: [] });
+  }
+  const state = tabCaptures.get(tabId);
+  state.scanning = true;
+
+  try {
+    const info = await getScrollInfo(tabId);
+    const { scrollHeight, viewportH, viewportW, dpr } = info;
+
+    // 캡처할 scrollY 위치 목록 생성 (viewport 단위로)
+    const positions = [];
+    for (let y = 0; y + viewportH <= scrollHeight; y += viewportH) {
+      positions.push(y);
+    }
+    // 페이지 맨 아래(나머지 영역)도 반드시 포함
+    const bottom = Math.max(0, scrollHeight - viewportH);
+    if (positions.length === 0 || positions[positions.length - 1] < bottom) {
+      positions.push(bottom);
+    }
+
+    for (const y of positions) {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (sy) => window.scrollTo(0, sy),
+        args: [y],
+      }).catch(() => {});
+      await sleep(150);
+
+      const actual = await getScrollInfo(tabId);
+      await doCapture(tabId, windowId, actual.scrollY, actual.scrollHeight, viewportH, viewportW, dpr);
+    }
+
+    // 스캔 후 맨 위로 복귀
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => window.scrollTo(0, 0),
+      args: [],
+    }).catch(() => {});
+  } finally {
+    state.scanning = false;
+  }
 }
 
 // ── 스크린샷 촬영 ─────────────────────────────────────────────────────────────
@@ -86,6 +134,9 @@ async function doCapture(tabId, windowId, scrollY, scrollHeight, viewportH, view
       tabCaptures.set(tabId, { windowId: tab.windowId, url: tab.url, title: tab.title, captures: [] });
     }
     const state = tabCaptures.get(tabId);
+    // 이미 캡처된 영역이면 중복 추가 방지
+    const last = state.captures[state.captures.length - 1];
+    if (last && scrollY + viewportH <= last.scrollY + last.viewportH) return;
     state.url = tab.url;
     state.title = tab.title;
     state.windowId = tab.windowId;
@@ -192,8 +243,7 @@ chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
   tabCaptures.set(tabId, { windowId, url: '', title: '', captures: [] });
 
   await sleep(400);
-  const info = await getScrollInfo(tabId);
-  await doCapture(tabId, windowId, info.scrollY, info.scrollHeight, info.viewportH, info.viewportW, info.dpr);
+  await fullPageScan(tabId, windowId);
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
@@ -204,8 +254,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   tabCaptures.set(tabId, { windowId: tab.windowId, url: tab.url, title: tab.title, captures: [] });
 
   await sleep(600);
-  const info = await getScrollInfo(tabId);
-  await doCapture(tabId, tab.windowId, info.scrollY, info.scrollHeight, info.viewportH, info.viewportW, info.dpr);
+  await fullPageScan(tabId, tab.windowId);
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
