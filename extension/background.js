@@ -64,14 +64,13 @@ async function handleScrollCapture(tabId, windowId, msg) {
   }
 
   const state = tabCaptures.get(tabId);
-  const { scrollY, scrollHeight, viewportH, viewportW, dpr } = msg;
-  // QA 증적: 스크롤 위치가 조금이라도 바뀌면 무조건 캡처
-  await doCapture(tabId, windowId || state.windowId, scrollY, scrollHeight, viewportH, viewportW, dpr);
+  const { scrollY, scrollHeight, viewportH, viewportW, dpr, isInner = false } = msg;
+  await doCapture(tabId, windowId || state.windowId, scrollY, scrollHeight, viewportH, viewportW, dpr, isInner);
 }
 
 
 // ── 스크린샷 촬영 ─────────────────────────────────────────────────────────────
-async function doCapture(tabId, windowId, scrollY, scrollHeight, viewportH, viewportW, dpr) {
+async function doCapture(tabId, windowId, scrollY, scrollHeight, viewportH, viewportW, dpr, isInner = false) {
   try {
     const tab = await chrome.tabs.get(tabId);
     const [activeTab] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
@@ -83,14 +82,23 @@ async function doCapture(tabId, windowId, scrollY, scrollHeight, viewportH, view
       tabCaptures.set(tabId, { windowId: tab.windowId, url: tab.url, title: tab.title, captures: [] });
     }
     const state = tabCaptures.get(tabId);
-    // 완전히 동일한 scrollY만 중복 방지
-    if (state.captures.some(c => c.scrollY === scrollY)) return;
+    const last = state.captures[state.captures.length - 1];
+
+    // 윈도우 스크롤: 직전 캡처와 scrollY가 같으면 중복 스킵
+    // 내부 스크롤(isInner): scrollY가 항상 0이므로 dedup 적용 안 함
+    if (!isInner && last && last.scrollY === scrollY) return;
+
+    // stitchY: 합성 이미지에서의 Y 위치
+    // - 윈도우 스크롤: scrollY 그대로 사용 (위치 기반 이어붙이기)
+    // - 내부 스크롤: 직전 캡처 아래에 이어붙이기
+    const stitchY = (isInner && last) ? last.stitchY + last.viewportH : scrollY;
+
     state.url = tab.url;
     state.title = tab.title;
     state.windowId = tab.windowId;
-    state.captures.push({ scrollY, scrollHeight, viewportH, viewportW, dpr, dataUrl });
+    state.captures.push({ scrollY, stitchY, scrollHeight, viewportH, viewportW, dpr, dataUrl });
 
-    console.log(`[QA] captured tab=${tabId} scrollY=${scrollY} total=${state.captures.length}`);
+    console.log(`[QA] captured tab=${tabId} scrollY=${scrollY} stitchY=${stitchY} inner=${isInner} total=${state.captures.length}`);
   } catch (e) {
     console.warn('[QA] captureVisibleTab error:', e.message);
   }
@@ -138,7 +146,8 @@ async function stitchCaptures(captures) {
   if (captures.length === 1) return captures[0].dataUrl;
 
   const { viewportW, dpr } = captures[0];
-  const totalCssH = captures.reduce((m, c) => Math.max(m, c.scrollY + c.viewportH), 0);
+  // stitchY 기준으로 총 높이 계산 (내부 스크롤 포함)
+  const totalCssH = captures.reduce((m, c) => Math.max(m, c.stitchY + c.viewportH), 0);
   const scale = Math.min(dpr || 1, 32000 / totalCssH);
 
   const canvasW = Math.round(viewportW * scale);
@@ -147,12 +156,12 @@ async function stitchCaptures(captures) {
   const offscreen = new OffscreenCanvas(canvasW, canvasH);
   const ctx = offscreen.getContext('2d');
 
-  const sorted = [...captures].sort((a, b) => a.scrollY - b.scrollY);
+  const sorted = [...captures].sort((a, b) => a.stitchY - b.stitchY);
   for (const cap of sorted) {
     const resp = await fetch(cap.dataUrl);
     const blob = await resp.blob();
     const bitmap = await createImageBitmap(blob);
-    ctx.drawImage(bitmap, 0, Math.round(cap.scrollY * scale));
+    ctx.drawImage(bitmap, 0, Math.round(cap.stitchY * scale));
     bitmap.close();
   }
 
