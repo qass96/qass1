@@ -64,13 +64,13 @@ async function handleScrollCapture(tabId, windowId, msg) {
   }
 
   const state = tabCaptures.get(tabId);
-  const { scrollY, scrollHeight, viewportH, viewportW, dpr, isInner = false } = msg;
-  await doCapture(tabId, windowId || state.windowId, scrollY, scrollHeight, viewportH, viewportW, dpr, isInner);
+  const { scrollY, scrollHeight, viewportH, viewportW, dpr } = msg;
+  await doCapture(tabId, windowId || state.windowId, scrollY, scrollHeight, viewportH, viewportW, dpr);
 }
 
 
 // ── 스크린샷 촬영 ─────────────────────────────────────────────────────────────
-async function doCapture(tabId, windowId, scrollY, scrollHeight, viewportH, viewportW, dpr, isInner = false) {
+async function doCapture(tabId, windowId, scrollY, scrollHeight, viewportH, viewportW, dpr) {
   try {
     const tab = await chrome.tabs.get(tabId);
     const [activeTab] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
@@ -84,21 +84,22 @@ async function doCapture(tabId, windowId, scrollY, scrollHeight, viewportH, view
     const state = tabCaptures.get(tabId);
     const last = state.captures[state.captures.length - 1];
 
-    // 윈도우 스크롤: 직전 캡처와 scrollY가 같으면 중복 스킵
-    // 내부 스크롤(isInner): scrollY가 항상 0이므로 dedup 적용 안 함
-    if (!isInner && last && last.scrollY === scrollY) return;
-
     // stitchY: 합성 이미지에서의 Y 위치
-    // - 윈도우 스크롤: scrollY 그대로 사용 (위치 기반 이어붙이기)
-    // - 내부 스크롤: 직전 캡처 아래에 이어붙이기
-    const stitchY = (isInner && last) ? last.stitchY + last.viewportH : scrollY;
+    // - scrollY가 바뀌었으면 scrollY 그대로 (윈도우 스크롤, 위치 기반 이어붙이기)
+    // - scrollY가 같으면 직전 캡처 아래에 추가 (내부 div 스크롤)
+    const stitchY = (last && scrollY === last.scrollY)
+      ? last.stitchY + last.viewportH
+      : scrollY;
+
+    // 직전과 완전히 동일한 위치(stitchY·scrollY 모두 같음)면 중복 스킵
+    if (last && last.scrollY === scrollY && last.stitchY === stitchY) return;
 
     state.url = tab.url;
     state.title = tab.title;
     state.windowId = tab.windowId;
     state.captures.push({ scrollY, stitchY, scrollHeight, viewportH, viewportW, dpr, dataUrl });
 
-    console.log(`[QA] captured tab=${tabId} scrollY=${scrollY} stitchY=${stitchY} inner=${isInner} total=${state.captures.length}`);
+    console.log(`[QA] captured tab=${tabId} scrollY=${scrollY} stitchY=${stitchY} total=${state.captures.length}`);
   } catch (e) {
     console.warn('[QA] captureVisibleTab error:', e.message);
   }

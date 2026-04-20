@@ -13,14 +13,12 @@ function getScrollInfo() {
 }
 
 // capture: true → window 및 내부 div 등 모든 스크롤 영역 감지
-document.addEventListener('scroll', (event) => {
-  // window/document 스크롤이 아닌 내부 요소 스크롤 여부 판별
-  const isInner = event.target !== document && event.target !== document.documentElement;
+document.addEventListener('scroll', () => {
   clearTimeout(scrollDebounceTimer);
   scrollDebounceTimer = setTimeout(() => {
     const info = getScrollInfo();
     try {
-      chrome.runtime.sendMessage({ type: 'SCROLL_CHANGED', ...info, isInner }).catch(() => {});
+      chrome.runtime.sendMessage({ type: 'SCROLL_CHANGED', ...info }).catch(() => {});
     } catch (_) {}
   }, 200);
 }, { passive: true, capture: true });
