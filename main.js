@@ -1,211 +1,323 @@
-const PAGE_NAMES = {
-  home: '홈',
-  product: '제품 소개',
-  service: '서비스',
-  contact: '문의',
-};
+'use strict';
 
-let currentPage = 'home';
-let captureLog = [];
-let toastTimer = null;
-let capturing = false;
+const SUPABASE_URL = 'https://snjexfohyklviarxprvm.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_c_1296S0EE8eHZO2EHnTIg_F2v4mov9';
 
-// BroadcastChannel: 같은 origin의 다른 탭과 통신
-const channel = new BroadcastChannel('qa_capture');
+const { createClient } = window.supabase;
+const db = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// 다른 탭에서 전달된 풀페이지 이미지 수신
-channel.addEventListener('message', e => {
-  if (e.data.type === 'full_page_image') {
-    saveCapture(e.data.dataUrl, e.data.label);
+let currentUser = null;
+let allCaptures = [];
+let realtimeChannel = null;
+
+// ── 초기화 ─────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', async () => {
+  bindAuthEvents();
+  bindDashboardEvents();
+
+  const { data: { session } } = await db.auth.getSession();
+  if (session) {
+    currentUser = session.user;
+    showDashboard();
+    await loadCaptures();
+    subscribeRealtime();
+  } else {
+    showAuth();
   }
-  if (e.data.type === 'capture_request') {
-    // 이 탭이 캡처 요청을 받으면 풀페이지 캡처 후 전송
-    doFullPageAndBroadcast(e.data.label);
-  }
+
+  db.auth.onAuthStateChange((event, session) => {
+    if (event === 'SIGNED_IN' && !currentUser) {
+      currentUser = session.user;
+      showDashboard();
+      loadCaptures();
+      subscribeRealtime();
+    } else if (event === 'SIGNED_OUT') {
+      currentUser = null;
+      allCaptures = [];
+      if (realtimeChannel) { db.removeChannel(realtimeChannel); realtimeChannel = null; }
+      showAuth();
+    }
+  });
 });
 
-// 탭 전환 감지: 다른 탭으로 이동할 때 해당 탭에 캡처 요청 전송
-document.addEventListener('visibilitychange', () => {
-  if (!capturing) return;
+// ── 인증 ───────────────────────────────────────────────────────────────────
+let authMode = 'login';
 
-  if (document.hidden) {
-    // 다른 탭에 캡처 요청 (페이지 로딩 대기 후)
-    setTimeout(() => {
-      channel.postMessage({ type: 'capture_request', label: '탭전환' });
-    }, 1500);
+function bindAuthEvents() {
+  document.querySelectorAll('.auth-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      authMode = tab.dataset.tab;
+      document.querySelectorAll('.auth-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === authMode));
+      document.getElementById('auth-submit').textContent = authMode === 'login' ? '로그인' : '회원가입';
+      document.getElementById('auth-name-wrap').classList.toggle('hidden', authMode === 'login');
+      document.getElementById('auth-error').classList.add('hidden');
+      document.getElementById('auth-notice').classList.add('hidden');
+    });
+  });
+
+  document.getElementById('auth-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const email = document.getElementById('auth-email').value.trim();
+    const password = document.getElementById('auth-password').value;
+    const errEl = document.getElementById('auth-error');
+    const noticeEl = document.getElementById('auth-notice');
+    const btn = document.getElementById('auth-submit');
+
+    errEl.classList.add('hidden');
+    noticeEl.classList.add('hidden');
+    btn.disabled = true;
+    btn.textContent = authMode === 'login' ? '로그인 중…' : '가입 중…';
+
+    try {
+      if (authMode === 'login') {
+        const { error } = await db.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+      } else {
+        const name = document.getElementById('auth-name').value.trim() || email.split('@')[0];
+        const { error } = await db.auth.signUp({
+          email, password,
+          options: { data: { display_name: name } },
+        });
+        if (error) throw error;
+        noticeEl.textContent = '가입 완료! 이메일 인증 링크를 확인하거나, 이메일 인증이 비활성화된 경우 바로 로그인하세요.';
+        noticeEl.classList.remove('hidden');
+      }
+    } catch (err) {
+      errEl.textContent = err.message;
+      errEl.classList.remove('hidden');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = authMode === 'login' ? '로그인' : '회원가입';
+    }
+  });
+}
+
+// ── 대시보드 이벤트 ────────────────────────────────────────────────────────
+function bindDashboardEvents() {
+  document.getElementById('btn-logout').addEventListener('click', () => db.auth.signOut());
+  document.getElementById('search').addEventListener('input', renderFiltered);
+  document.getElementById('filter-user').addEventListener('change', renderFiltered);
+  document.getElementById('btn-dl-zip').addEventListener('click', downloadZip);
+  document.getElementById('btn-close-modal').addEventListener('click', () => {
+    document.getElementById('ext-modal').classList.add('hidden');
+  });
+}
+
+// ── 캡처 목록 로드 ─────────────────────────────────────────────────────────
+async function loadCaptures() {
+  setLoading(true);
+  try {
+    const { data, error } = await db
+      .from('captures')
+      .select('*')
+      .order('captured_at', { ascending: false });
+
+    if (error) throw error;
+    allCaptures = data || [];
+    buildUserFilter();
+    renderFiltered();
+  } catch (err) {
+    console.error('[QASS]', err.message);
+  } finally {
+    setLoading(false);
   }
-});
-
-// 현재 탭 내 메뉴 이동
-function navigate(pageId) {
-  if (pageId === currentPage) return;
-  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-  document.getElementById('page-' + pageId).classList.add('active');
-  currentPage = pageId;
-
-  if (!capturing) return;
-
-  window.scrollTo(0, 0);
-  // 렌더링 완료 대기 후 풀페이지 캡처
-  requestAnimationFrame(() => requestAnimationFrame(() => {
-    setTimeout(() => captureFullPage(PAGE_NAMES[pageId]), 300);
-  }));
 }
 
-// 풀페이지 캡처 → 로그에 저장
-function captureFullPage(label) {
-  window.scrollTo(0, 0);
-  setTimeout(() => {
-    const fullH = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-    const fullW = document.documentElement.offsetWidth;
+function buildUserFilter() {
+  const users = [...new Set(allCaptures.map(c => c.user_email).filter(Boolean))];
+  const select = document.getElementById('filter-user');
+  const prev = select.value;
+  select.innerHTML = '<option value="">전체 사용자</option>';
+  users.forEach(u => {
+    const opt = document.createElement('option');
+    opt.value = u;
+    opt.textContent = u;
+    if (u === prev) opt.selected = true;
+    select.appendChild(opt);
+  });
+}
 
-    html2canvas(document.documentElement, {
-      scale: window.devicePixelRatio || 2,
-      useCORS: true,
-      logging: false,
-      backgroundColor: '#f4f6fb',
-      scrollX: 0,
-      scrollY: 0,
-      width: fullW,
-      height: fullH,
-      windowWidth: fullW,
-      windowHeight: fullH,
-    }).then(canvas => {
-      saveCapture(canvas.toDataURL('image/png'), label);
+// ── 실시간 구독 ────────────────────────────────────────────────────────────
+function subscribeRealtime() {
+  realtimeChannel = db.channel('captures-realtime')
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'captures' }, payload => {
+      allCaptures.unshift(payload.new);
+      buildUserFilter();
+      renderFiltered();
+    })
+    .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'captures' }, payload => {
+      allCaptures = allCaptures.filter(c => c.id !== payload.old.id);
+      renderFiltered();
+    })
+    .subscribe(status => {
+      document.getElementById('realtime-badge').classList.toggle('hidden', status !== 'SUBSCRIBED');
     });
-  }, 300);
 }
 
-// 풀페이지 캡처 → BroadcastChannel로 컨트롤 탭에 전송
-function doFullPageAndBroadcast(label) {
-  window.scrollTo(0, 0);
-  setTimeout(() => {
-    const fullH = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-    const fullW = document.documentElement.offsetWidth;
+// ── 렌더링 ─────────────────────────────────────────────────────────────────
+function renderFiltered() {
+  const search = document.getElementById('search').value.toLowerCase();
+  const filterUser = document.getElementById('filter-user').value;
 
-    html2canvas(document.documentElement, {
-      scale: window.devicePixelRatio || 2,
-      useCORS: true,
-      logging: false,
-      backgroundColor: '#f4f6fb',
-      scrollX: 0,
-      scrollY: 0,
-      width: fullW,
-      height: fullH,
-      windowWidth: fullW,
-      windowHeight: fullH,
-    }).then(canvas => {
-      channel.postMessage({
-        type: 'full_page_image',
-        dataUrl: canvas.toDataURL('image/png'),
-        label,
-      });
-    });
-  }, 300);
+  const filtered = allCaptures.filter(c => {
+    const matchSearch = !search ||
+      (c.title || '').toLowerCase().includes(search) ||
+      (c.url || '').toLowerCase().includes(search);
+    const matchUser = !filterUser || c.user_email === filterUser;
+    return matchSearch && matchUser;
+  });
+
+  document.getElementById('count-label').textContent = `${filtered.length}건`;
+  renderGrid(filtered);
 }
 
-function startCapture() {
-  capturing = true;
-  setUICapturing(true);
-  showToast('캡처 시작 — 페이지 이동 시 전체 페이지가 자동 캡처됩니다.');
-  // 현재 페이지 즉시 캡처
-  captureFullPage(PAGE_NAMES[currentPage] || '시작');
+function renderGrid(captures) {
+  const grid = document.getElementById('captures-grid');
+  grid.innerHTML = '';
+
+  if (captures.length === 0) {
+    grid.innerHTML = '<div class="empty-state">캡처된 증적이 없습니다.</div>';
+    return;
+  }
+
+  captures.forEach(cap => {
+    const card = document.createElement('div');
+    card.className = 'capture-card';
+
+    const imgUrl = getPublicUrl(cap.image_path);
+    const isMe = cap.user_id === currentUser?.id;
+    const displayName = cap.user_display_name || cap.user_email || '—';
+    const time = cap.captured_at ? new Date(cap.captured_at).toLocaleString('ko-KR') : '—';
+
+    card.innerHTML = `
+      <div class="card-thumb" style="background-image:url('${esc(imgUrl)}')" title="클릭하면 원본 이미지 열기"></div>
+      <div class="card-body">
+        <div class="card-title" title="${esc(cap.title || '')}">${esc(cap.title || '—')}</div>
+        <div class="card-url" title="${esc(cap.url || '')}">${esc(cap.url || '—')}</div>
+        <div class="card-meta">
+          <span class="badge-user${isMe ? ' me' : ''}">${esc(displayName)}</span>
+          <span class="card-time">${time}</span>
+          ${cap.capture_count > 1 ? `<span class="card-pieces">${cap.capture_count}조각</span>` : ''}
+        </div>
+      </div>
+      <div class="card-actions">
+        <button class="btn-sm" data-action="view">보기</button>
+        <button class="btn-sm btn-primary" data-action="dl">저장</button>
+        ${isMe ? '<button class="btn-sm btn-danger" data-action="del">삭제</button>' : ''}
+      </div>
+    `;
+
+    card.querySelector('.card-thumb').addEventListener('click', () => openCapture(imgUrl));
+    card.querySelector('[data-action="view"]').addEventListener('click', () => openCapture(imgUrl));
+    card.querySelector('[data-action="dl"]').addEventListener('click', () => downloadCapture(cap));
+    card.querySelector('[data-action="del"]')?.addEventListener('click', () => deleteCapture(cap));
+
+    grid.appendChild(card);
+  });
 }
 
-function stopCapture() {
-  capturing = false;
-  setUICapturing(false);
-  showToast(`캡처 종료 — 총 ${captureLog.length}개 저장됨`);
+// ── 이미지 URL ─────────────────────────────────────────────────────────────
+function getPublicUrl(path) {
+  if (!path) return '';
+  const { data } = db.storage.from('qa-captures').getPublicUrl(path);
+  return data.publicUrl;
 }
 
-function snapNow() {
-  captureFullPage('수동');
-  // 다른 탭에도 동시에 캡처 요청
-  channel.postMessage({ type: 'capture_request', label: '수동' });
+// ── 액션 ───────────────────────────────────────────────────────────────────
+function openCapture(url) {
+  window.open(url, '_blank');
 }
 
-function saveCapture(dataUrl, label) {
-  const now = new Date();
-  const timeStr = now.toLocaleString('ko-KR');
-  const seq = String(captureLog.length + 1).padStart(3, '0');
-  const fileName = `QA_${seq}_${label}_${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.png`;
-
-  captureLog.push({ pageName: label, dataUrl, timeStr, fileName });
-  updateCount();
-  renderLogItem(captureLog[captureLog.length - 1]);
-  showToast(`[${label}] 전체 페이지 캡처 완료 (${captureLog.length}번째)`);
-}
-
-function setUICapturing(on) {
-  document.getElementById('btn-start').disabled = on;
-  document.getElementById('btn-stop').disabled = !on;
-  document.getElementById('btn-snap').disabled = !on;
-  const status = document.getElementById('capture-status');
-  status.textContent = on ? '캡처 중' : '대기 중';
-  status.className = 'capture-status ' + (on ? 'running' : 'stopped');
-}
-
-function pad(n) {
-  return String(n).padStart(2, '0');
-}
-
-function updateCount() {
-  document.getElementById('capture-count').textContent = captureLog.length;
-}
-
-function renderLogItem(item) {
-  const list = document.getElementById('log-list');
-  const empty = list.querySelector('.empty-msg');
-  if (empty) empty.remove();
-
-  const div = document.createElement('div');
-  div.className = 'capture-item';
-  div.innerHTML = `
-    <div class="capture-item-header">
-      <span class="capture-item-title">${item.pageName}</span>
-      <span class="capture-item-time">${item.timeStr}</span>
-    </div>
-    <img src="${item.dataUrl}" alt="${item.pageName}" title="클릭 시 전체 보기" onclick="openFull('${item.dataUrl}')" />
-    <div class="capture-item-footer">
-      <button class="btn-dl" onclick="downloadOne('${item.fileName}', '${item.dataUrl}')">다운로드</button>
-    </div>
-  `;
-  list.appendChild(div);
-}
-
-function openFull(dataUrl) {
-  const w = window.open();
-  w.document.write(`<img src="${dataUrl}" style="max-width:100%;display:block;margin:auto;" />`);
-}
-
-function downloadOne(fileName, dataUrl) {
+async function downloadCapture(cap) {
+  const url = getPublicUrl(cap.image_path);
+  const res = await fetch(url);
+  const blob = await res.blob();
   const a = document.createElement('a');
-  a.href = dataUrl;
-  a.download = fileName;
+  a.href = URL.createObjectURL(blob);
+  a.download = makeFileName(cap.title, cap.captured_at);
   a.click();
+  URL.revokeObjectURL(a.href);
 }
 
-function downloadAll() {
-  if (captureLog.length === 0) { showToast('다운로드할 캡처가 없습니다.'); return; }
-  captureLog.forEach((item, i) => setTimeout(() => downloadOne(item.fileName, item.dataUrl), i * 300));
-  showToast(`${captureLog.length}개 캡처 다운로드 시작`);
+async function downloadZip() {
+  const search = document.getElementById('search').value.toLowerCase();
+  const filterUser = document.getElementById('filter-user').value;
+  const filtered = allCaptures.filter(c => {
+    const matchSearch = !search ||
+      (c.title || '').toLowerCase().includes(search) ||
+      (c.url || '').toLowerCase().includes(search);
+    return matchSearch && (!filterUser || c.user_email === filterUser);
+  });
+
+  if (!filtered.length) return;
+  setLoading(true);
+
+  try {
+    const zip = new JSZip();
+    for (const cap of filtered) {
+      const res = await fetch(getPublicUrl(cap.image_path));
+      const blob = await res.blob();
+      zip.file(makeFileName(cap.title, cap.captured_at), blob);
+    }
+    const content = await zip.generateAsync({ type: 'blob' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(content);
+    a.download = `QASS_증적_${new Date().toLocaleDateString('ko-KR').replace(/\.\s*/g, '-').replace(/-$/, '')}.zip`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch (err) {
+    alert('ZIP 생성 실패: ' + err.message);
+  } finally {
+    setLoading(false);
+  }
 }
 
-function clearLog() {
-  captureLog = [];
-  updateCount();
-  document.getElementById('log-list').innerHTML = '<p class="empty-msg">아직 캡처된 페이지가 없습니다.</p>';
-  showToast('캡처 로그가 초기화되었습니다.');
+async function deleteCapture(cap) {
+  if (!confirm(`"${cap.title || cap.url}" 캡처를 삭제할까요?`)) return;
+  setLoading(true);
+  try {
+    if (cap.image_path) {
+      await db.storage.from('qa-captures').remove([cap.image_path]);
+    }
+    const { error } = await db.from('captures').delete().eq('id', cap.id);
+    if (error) throw error;
+    allCaptures = allCaptures.filter(c => c.id !== cap.id);
+    renderFiltered();
+  } catch (err) {
+    alert('삭제 실패: ' + err.message);
+  } finally {
+    setLoading(false);
+  }
 }
 
-function toggleLog() {
-  document.getElementById('capture-log').classList.toggle('hidden');
+// ── 유틸 ───────────────────────────────────────────────────────────────────
+function showAuth() {
+  document.getElementById('auth-screen').classList.remove('hidden');
+  document.getElementById('dashboard').classList.add('hidden');
 }
 
-function showToast(msg) {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.classList.remove('hidden');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.add('hidden'), 2500);
+function showDashboard() {
+  document.getElementById('auth-screen').classList.add('hidden');
+  document.getElementById('dashboard').classList.remove('hidden');
+  const name = currentUser?.user_metadata?.display_name || currentUser?.email || '';
+  document.getElementById('user-email').textContent = name;
+}
+
+function setLoading(v) {
+  document.getElementById('loading').classList.toggle('hidden', !v);
+}
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function makeFileName(title, timestamp) {
+  const safe = (title || 'capture').replace(/[\\/:*?"<>|]/g, '_').slice(0, 40);
+  const ts = new Date(timestamp || Date.now())
+    .toLocaleString('ko-KR').replace(/[^0-9]/g, '').slice(0, 14);
+  return `QA_${safe}_${ts}.png`;
 }

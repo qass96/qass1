@@ -6,6 +6,25 @@
   <link rel="stylesheet" href="popup.css" />
 </head>
 <body>
+
+  <!-- 클라우드 동기화 섹션 -->
+  <div id="cloud-section" class="cloud-section">
+    <!-- 로그인 상태 -->
+    <div id="cloud-logged-in" class="cloud-logged-in hidden">
+      <span class="cloud-icon">☁</span>
+      <span id="cloud-user-label" class="cloud-user-label"></span>
+      <button id="btn-ext-logout" class="btn-ext-logout">로그아웃</button>
+    </div>
+    <!-- 로그인 폼 -->
+    <div id="cloud-login-form" class="cloud-login-form">
+      <div class="cloud-login-title">☁ 클라우드 동기화 로그인</div>
+      <input type="email" id="ext-email" placeholder="이메일" autocomplete="email" />
+      <input type="password" id="ext-password" placeholder="비밀번호" autocomplete="current-password" />
+      <button id="btn-ext-login" class="btn-ext-login">로그인</button>
+      <p id="ext-auth-error" class="ext-auth-error hidden"></p>
+    </div>
+  </div>
+
   <div class="header">
     <div class="header-title">QA 증적 캡처</div>
     <div class="header-controls">

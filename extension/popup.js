@@ -1,22 +1,82 @@
 'use strict';
 
+const SUPABASE_URL = 'https://snjexfohyklviarxprvm.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_c_1296S0EE8eHZO2EHnTIg_F2v4mov9';
+
 let isCapturing = false;
 let cachedHistory = [];
 
 // ── 초기화 ────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
-  // 모든 버튼 이벤트는 여기서만 등록 (HTML에 onclick 없음 — MV3 CSP 준수)
   document.getElementById('btn-toggle').addEventListener('click', onToggle);
   document.getElementById('btn-clear').addEventListener('click', onClear);
   document.getElementById('btn-dl-all').addEventListener('click', onDownloadAll);
+  document.getElementById('btn-ext-login').addEventListener('click', onExtLogin);
+  document.getElementById('btn-ext-logout').addEventListener('click', onExtLogout);
 
   const resp = await chrome.runtime.sendMessage({ type: 'GET_STATUS' });
   isCapturing = resp.isCapturing;
   updateUI();
   await loadHistory();
+  await updateCloudUI();
 });
 
-// ── 버튼 핸들러 ───────────────────────────────────────────────────────────────
+// ── 클라우드 인증 UI ──────────────────────────────────────────────────────────
+async function updateCloudUI() {
+  const { supabaseSession } = await chrome.storage.local.get('supabaseSession');
+  const loggedIn = !!supabaseSession?.user;
+  document.getElementById('cloud-logged-in').classList.toggle('hidden', !loggedIn);
+  document.getElementById('cloud-login-form').classList.toggle('hidden', loggedIn);
+  if (loggedIn) {
+    const label = supabaseSession.user.user_metadata?.display_name || supabaseSession.user.email;
+    document.getElementById('cloud-user-label').textContent = label;
+  }
+}
+
+async function onExtLogin() {
+  const email = document.getElementById('ext-email').value.trim();
+  const password = document.getElementById('ext-password').value;
+  const errEl = document.getElementById('ext-auth-error');
+  const btn = document.getElementById('btn-ext-login');
+  errEl.classList.add('hidden');
+
+  if (!email || !password) return;
+
+  btn.textContent = '로그인 중…';
+  btn.disabled = true;
+
+  try {
+    const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+      method: 'POST',
+      headers: { 'apikey': SUPABASE_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error_description || data.msg || '로그인 실패');
+
+    await chrome.storage.local.set({
+      supabaseSession: {
+        access_token: data.access_token,
+        refresh_token: data.refresh_token,
+        user: data.user,
+      },
+    });
+    await updateCloudUI();
+  } catch (e) {
+    errEl.textContent = e.message;
+    errEl.classList.remove('hidden');
+  } finally {
+    btn.textContent = '로그인';
+    btn.disabled = false;
+  }
+}
+
+async function onExtLogout() {
+  await chrome.storage.local.remove('supabaseSession');
+  await updateCloudUI();
+}
+
+// ── 캡처 토글 ─────────────────────────────────────────────────────────────────
 async function onToggle() {
   isCapturing = !isCapturing;
   await chrome.runtime.sendMessage({ type: 'SET_CAPTURING', value: isCapturing });
@@ -81,11 +141,9 @@ function renderList(history) {
     const item = document.createElement('div');
     item.className = 'capture-item';
 
-    // 헤더
     const header = document.createElement('div');
     header.className = 'item-header';
 
-    // 메타 정보 (innerHTML 대신 textContent 사용)
     const meta = document.createElement('div');
     meta.className = 'item-meta';
 
@@ -101,13 +159,29 @@ function renderList(history) {
 
     const infoEl = document.createElement('div');
     infoEl.className = 'item-info';
-    infoEl.textContent = rec.timestamp + ' · ' + rec.captureCount + '개 조각 합성';
+    infoEl.textContent = rec.timestamp + ' · ' + rec.captureCount + '개 조각';
+
+    // 클라우드 업로드 상태 배지
+    const badge = document.createElement('span');
+    badge.className = 'cloud-badge';
+    if (rec.uploaded === true) {
+      badge.className += ' uploaded';
+      badge.textContent = '☁ 업로드됨';
+    } else if (rec.uploading) {
+      badge.className += ' uploading';
+      badge.textContent = '↑ 업로드 중';
+    } else if (rec.uploadFailed) {
+      badge.className += ' failed';
+      badge.textContent = '✕ 업로드 실패';
+    }
+    if (rec.uploaded || rec.uploading || rec.uploadFailed) {
+      infoEl.appendChild(badge);
+    }
 
     meta.appendChild(titleEl);
     meta.appendChild(urlEl);
     meta.appendChild(infoEl);
 
-    // 액션 버튼
     const actions = document.createElement('div');
     actions.className = 'item-actions';
 
@@ -125,7 +199,6 @@ function renderList(history) {
     header.appendChild(meta);
     header.appendChild(actions);
 
-    // 썸네일
     const img = document.createElement('img');
     img.src = rec.dataUrl;
     img.className = 'item-thumb';
@@ -143,8 +216,6 @@ function renderList(history) {
 function openFullView(id) {
   const rec = cachedHistory.find(r => String(r.id) === String(id));
   if (!rec) return;
-
-  // data URL을 Blob URL로 변환해서 새 탭에 표시 (document.write 미사용)
   fetch(rec.dataUrl)
     .then(r => r.blob())
     .then(blob => {

@@ -1,3 +1,8 @@
+'use strict';
+
+const SUPABASE_URL = 'https://snjexfohyklviarxprvm.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_c_1296S0EE8eHZO2EHnTIg_F2v4mov9';
+
 // ── 상태 ──────────────────────────────────────────────────────────────────────
 let isCapturing = false;
 const tabCaptures = new Map(); // tabId → { windowId, url, title, captures[], scanning }
@@ -61,13 +66,13 @@ async function handleScrollCapture(tabId, windowId, msg) {
     tabCaptures.set(tabId, { windowId, url: '', title: '', captures: [] });
   }
   const state = tabCaptures.get(tabId);
-  if (state.scanning) return; // 자동 스캔 중에는 수동 스크롤 무시
+  if (state.scanning) return;
 
   const { scrollY, scrollHeight, viewportH, viewportW, dpr } = msg;
   await doCapture(tabId, windowId || state.windowId, scrollY, scrollHeight, viewportH, viewportW, dpr);
 }
 
-// ── 페이지 전체 자동 스캔 (윈도우 + 내부 스크롤) ──────────────────────────────
+// ── 페이지 전체 자동 스캔 ─────────────────────────────────────────────────────
 async function fullPageScan(tabId, windowId) {
   if (!tabCaptures.has(tabId)) {
     tabCaptures.set(tabId, { windowId, url: '', title: '', captures: [] });
@@ -76,24 +81,17 @@ async function fullPageScan(tabId, windowId) {
   state.scanning = true;
 
   try {
-    // 1. 윈도우 스크롤 전체 스캔
     await windowScan(tabId, windowId);
-
-    // 2. 내부 스크롤 요소 스캔
     await innerScan(tabId, windowId);
-
-    // 3. 맨 위로 복귀
     await chrome.scripting.executeScript({
       target: { tabId },
       func: () => window.scrollTo(0, 0),
-      args: [],
     }).catch(() => {});
   } finally {
     state.scanning = false;
   }
 }
 
-// 윈도우 스크롤 전체 스캔
 async function windowScan(tabId, windowId) {
   const info = await getScrollInfo(tabId);
   const { scrollHeight, viewportH, viewportW, dpr } = info;
@@ -119,9 +117,7 @@ async function windowScan(tabId, windowId) {
   }
 }
 
-// 내부 스크롤 요소 스캔
 async function innerScan(tabId, windowId) {
-  // 스크롤 가능한 내부 요소 탐색 및 임시 인덱스 부여
   let elements = [];
   try {
     const [res] = await chrome.scripting.executeScript({
@@ -174,7 +170,6 @@ async function innerScan(tabId, windowId) {
       await doCapture(tabId, windowId, actual.scrollY, pageScrollHeight, viewportH, viewportW, dpr);
     }
 
-    // 요소 맨 위로 복귀
     await chrome.scripting.executeScript({
       target: { tabId },
       func: (i) => { const el = document.querySelector(`[data-qa-scan="${i}"]`); if (el) el.scrollTop = 0; },
@@ -182,7 +177,6 @@ async function innerScan(tabId, windowId) {
     }).catch(() => {});
   }
 
-  // 임시 마킹 제거
   await chrome.scripting.executeScript({
     target: { tabId },
     func: () => document.querySelectorAll('[data-qa-scan]').forEach(el => el.removeAttribute('data-qa-scan')),
@@ -204,12 +198,10 @@ async function doCapture(tabId, windowId, scrollY, scrollHeight, viewportH, view
     const state = tabCaptures.get(tabId);
     const last = state.captures[state.captures.length - 1];
 
-    // scrollY가 같으면 내부 스크롤로 간주 → 직전 캡처 아래에 이어붙이기
     const stitchY = (last && scrollY === last.scrollY)
       ? last.stitchY + last.viewportH
       : scrollY;
 
-    // 직전과 완전히 동일한 위치면 중복 스킵
     if (last && last.scrollY === scrollY && last.stitchY === stitchY) return;
 
     state.url = tab.url;
@@ -223,7 +215,7 @@ async function doCapture(tabId, windowId, scrollY, scrollHeight, viewportH, view
   }
 }
 
-// ── 탭 완료 처리 (캡처 조각 → 합성 → 저장) ───────────────────────────────────
+// ── 탭 완료 처리 ──────────────────────────────────────────────────────────────
 async function finalizeTab(tabId) {
   const state = tabCaptures.get(tabId);
   tabCaptures.delete(tabId);
@@ -239,6 +231,9 @@ async function finalizeTab(tabId) {
     dataUrl: stitchedDataUrl,
     captureCount: state.captures.length,
     timestamp: new Date().toLocaleString('ko-KR'),
+    uploaded: false,
+    uploading: false,
+    uploadFailed: false,
   };
 
   const { history = [] } = await chrome.storage.local.get('history');
@@ -248,11 +243,89 @@ async function finalizeTab(tabId) {
   if (history.length > 30) history.splice(30);
   await chrome.storage.local.set({ history });
   console.log(`[QA] saved "${record.title}" (${record.captureCount} pieces)`);
+
+  // 클라우드 업로드 (비동기, 로컬 저장 후 별도 진행)
+  uploadToCloud(record).catch(e => console.warn('[QA] cloud upload error:', e.message));
 }
 
 async function finalizeAll() {
   for (const tabId of [...tabCaptures.keys()]) {
     await finalizeTab(tabId);
+  }
+}
+
+// ── Supabase 클라우드 업로드 ──────────────────────────────────────────────────
+async function uploadToCloud(record) {
+  const { supabaseSession } = await chrome.storage.local.get('supabaseSession');
+  if (!supabaseSession?.access_token) return; // 로그인 안 된 경우 skip
+
+  const { access_token, user } = supabaseSession;
+
+  // 로컬 history에서 uploading 상태로 업데이트
+  await updateHistoryRecord(record.id, { uploading: true, uploaded: false, uploadFailed: false });
+
+  try {
+    // dataUrl → Blob
+    const res = await fetch(record.dataUrl);
+    const blob = await res.blob();
+
+    // Storage 업로드
+    const path = `${user.id}/${record.id}.png`;
+    const uploadRes = await fetch(`${SUPABASE_URL}/storage/v1/object/qa-captures/${path}`, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${access_token}`,
+        'Content-Type': 'image/png',
+        'x-upsert': 'true',
+      },
+      body: blob,
+    });
+
+    if (!uploadRes.ok) {
+      const err = await uploadRes.json().catch(() => ({}));
+      throw new Error(err.message || `Storage upload failed: ${uploadRes.status}`);
+    }
+
+    // DB 레코드 삽입
+    const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/captures`, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${access_token}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=minimal',
+      },
+      body: JSON.stringify({
+        user_id: user.id,
+        user_email: user.email,
+        user_display_name: user.user_metadata?.display_name || user.email,
+        url: record.url,
+        title: record.title,
+        capture_count: record.captureCount,
+        image_path: path,
+      }),
+    });
+
+    if (!insertRes.ok) {
+      const err = await insertRes.json().catch(() => ({}));
+      throw new Error(err.message || `DB insert failed: ${insertRes.status}`);
+    }
+
+    await updateHistoryRecord(record.id, { uploading: false, uploaded: true, uploadFailed: false });
+    console.log(`[QA] cloud upload success: "${record.title}"`);
+  } catch (e) {
+    await updateHistoryRecord(record.id, { uploading: false, uploaded: false, uploadFailed: true });
+    console.warn('[QA] cloud upload failed:', e.message);
+  }
+}
+
+async function updateHistoryRecord(id, fields) {
+  const { history = [] } = await chrome.storage.local.get('history');
+  const idx = history.findIndex(r => r.id === id);
+  if (idx !== -1) {
+    Object.assign(history[idx], fields);
+    await chrome.storage.local.set({ history });
   }
 }
 
@@ -309,7 +382,6 @@ function getScrollInfo(tabId) {
 }
 
 // ── 탭 이벤트 ─────────────────────────────────────────────────────────────────
-
 chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
   if (prevTabId && prevTabId !== tabId && tabCaptures.has(prevTabId)) {
     await finalizeTab(prevTabId);
